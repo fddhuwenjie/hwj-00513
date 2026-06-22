@@ -103,6 +103,8 @@ class DependencyAnalyzer:
         self.services = services
         self.dependencies: Dict[str, Set[str]] = defaultdict(set)
         self.dependents: Dict[str, Set[str]] = defaultdict(set)
+        self.network_groups: Dict[str, Set[str]] = defaultdict(set)
+        self.service_networks: Dict[str, Set[str]] = defaultdict(set)
         self._build_graph()
 
     def _add_dependency(self, service: str, dependency: str):
@@ -111,10 +113,55 @@ class DependencyAnalyzer:
             self.dependencies[service].add(dependency)
             self.dependents[dependency].add(service)
 
+    @staticmethod
+    def _extract_network_names(networks_config: Any) -> List[str]:
+        """从 networks 配置中提取网络名称列表"""
+        if isinstance(networks_config, dict):
+            return list(networks_config.keys())
+        elif isinstance(networks_config, list):
+            names = []
+            for n in networks_config:
+                if isinstance(n, str):
+                    names.append(n)
+                elif isinstance(n, dict):
+                    names.extend(n.keys())
+            return names
+        elif isinstance(networks_config, str):
+            return [networks_config]
+        return ['default']
+
+    def _has_path(self, src: str, dst: str) -> bool:
+        """检查是否存在从 src 到 dst 的路径（BFS）"""
+        if src == dst:
+            return True
+        visited = set()
+        queue = deque([src])
+        while queue:
+            node = queue.popleft()
+            if node in visited:
+                continue
+            visited.add(node)
+            for neighbor in self.dependencies.get(node, set()):
+                if neighbor == dst:
+                    return True
+                if neighbor not in visited:
+                    queue.append(neighbor)
+        return False
+
     def _build_graph(self):
         """构建依赖图"""
+        # 第一阶段：收集每个服务的网络归属
         for name, config in self.services.items():
-            # 1. 从 depends_on 提取
+            networks_config = config.get('networks')
+            network_names = self._extract_network_names(networks_config)
+            if not network_names:
+                network_names = ['default']
+            for net in network_names:
+                self.network_groups[net].add(name)
+                self.service_networks[name].add(net)
+
+        # 第二阶段：从 depends_on 提取强依赖
+        for name, config in self.services.items():
             depends_on = config.get('depends_on', [])
             if isinstance(depends_on, dict):
                 for dep in depends_on.keys():
@@ -127,16 +174,8 @@ class DependencyAnalyzer:
                         for dep_name in dep.keys():
                             self._add_dependency(name, dep_name)
 
-            # 2. 从 networks 提取（服务共享网络表示潜在依赖）
-            networks = config.get('networks', [])
-            if isinstance(networks, dict):
-                network_names = list(networks.keys())
-            elif isinstance(networks, list):
-                network_names = [n if isinstance(n, str) else list(n.keys())[0] for n in networks]
-            else:
-                network_names = []
-
-            # 3. 从环境变量中推断服务名引用
+        # 第三阶段：从环境变量中推断服务名引用（强依赖）
+        for name, config in self.services.items():
             env = config.get('environment', {})
             env_values = []
             if isinstance(env, dict):
@@ -148,11 +187,45 @@ class DependencyAnalyzer:
 
             service_names = set(self.services.keys())
             for val in env_values:
-                if isinstance(val, str):
-                    for svc in service_names:
-                        if svc in val and svc != name:
-                            self._add_dependency(name, svc)
-                            break
+                if not isinstance(val, str):
+                    continue
+                # 去掉变量引用展开的花括号内容，避免 ${VAR:-default} 中的 default 可能偶然匹配服务名
+                # 只保留实际字面量部分（去掉 $ 开头引用的内容）
+                cleaned_val = re.sub(r'\$\{[^}]+\}', '', val)
+                # 检查是否明确引用了其他服务名（主机名格式，如 "service_name:port 或 http://service_name/ 等）
+                # 更严格：只有服务名作为独立标识符，不是其他单词的子串
+                for svc in service_names:
+                    if svc == name:
+                        continue
+                    # 使用单词边界匹配，避免 wordpress 匹配 wordpress 匹配默认值
+                    pattern = re.compile(r'(?<![a-zA-Z0-9_])' + re.escape(svc) + r'(?![a-zA-Z0-9_])')
+                    if pattern.search(cleaned_val):
+                        self._add_dependency(name, svc)
+                        break
+
+        # 第四阶段：从共享网络推断弱依赖（拓扑参考）
+        # 仅对完全没有任何强依赖关系（既不依赖也不被依赖）的孤立服务，按网络分组建立引用
+        # 严格避免产生循环依赖：添加前检查是否存在反向路径
+        for net, members in self.network_groups.items():
+            if len(members) < 2:
+                continue
+            sorted_members = sorted(members)
+            for i, svc in enumerate(sorted_members):
+                # 跳过已有强依赖或者被其他服务依赖的服务，避免引入循环
+                if self.dependencies.get(svc) or self.dependents.get(svc):
+                    continue
+                # 找到同组中第一个满足：other 也没有依赖/被依赖，且 other 到 svc 没有路径
+                for other in sorted_members[i + 1:]:
+                    if self.dependencies.get(other) or self.dependents.get(other):
+                        continue
+                    # 确保不会形成循环：other 不能有路径到达 svc
+                    if not self._has_path(other, svc):
+                        self._add_dependency(svc, other)
+                        break
+
+    def get_network_groups(self) -> Dict[str, Set[str]]:
+        """获取按网络分组的服务"""
+        return dict(self.network_groups)
 
     def detect_cycles(self) -> List[List[str]]:
         """检测循环依赖，使用 Tarjan 算法"""
@@ -222,8 +295,20 @@ class DependencyAnalyzer:
         """生成 ASCII 依赖图"""
         lines: List[str] = []
         lines.append("Docker Compose 服务依赖图")
-        lines.append("=" * 50)
+        lines.append("=" * 60)
 
+        # 网络分组信息
+        if self.network_groups:
+            lines.append("")
+            lines.append("📡 按网络分组的服务:")
+            for net in sorted(self.network_groups.keys()):
+                members = sorted(self.network_groups[net])
+                lines.append(f"  {net}: {', '.join(members)}")
+            lines.append("")
+            lines.append("-" * 60)
+
+        lines.append("")
+        lines.append("🔗 依赖关系:")
         topo = self.topological_sort()
         for svc in topo:
             deps = sorted(self.dependencies.get(svc, set()))
@@ -258,10 +343,49 @@ class DependencyAnalyzer:
         lines.append('    rankdir=LR;')
         lines.append('    node [shape=box, style=filled, fillcolor="#e3f2fd", fontname="Helvetica"];')
         lines.append('    edge [color="#1976d2"];')
+        lines.append('    compound=true;')
         lines.append('')
 
+        # 用 subgraph cluster 展示网络分组
+        network_colors = [
+            '#bbdefb', '#c8e6c9', '#fff9c4', '#ffccbc', '#f8bbd0',
+            '#d1c4e9', '#b2ebf2', '#f0f4c3', '#ffe0b2', '#e1bee7'
+        ]
+        for i, (net, members) in enumerate(sorted(self.network_groups.items())):
+            if len(members) < 2:
+                continue
+            color = network_colors[i % len(network_colors)]
+            cluster_name = re.sub(r'[^a-zA-Z0-9_]', '_', f'cluster_{net}')
+            lines.append(f'    subgraph {cluster_name} {{')
+            lines.append(f'        label = "网络: {net}";')
+            lines.append(f'        style = filled;')
+            lines.append(f'        color = "{color}";')
+            lines.append(f'        fillcolor = "{color}40";')
+            for svc in sorted(members):
+                lines.append(f'        "{svc}";')
+            lines.append('    }')
+            lines.append('')
+
+        # 节点定义（未在任何网络cluster中的服务）
         for svc in sorted(self.services.keys()):
-            deps = sorted(self.dependencies.get(svc, set()))
+            in_cluster = False
+            for members in self.network_groups.values():
+                if svc in members and len(members) >= 2:
+                    in_cluster = True
+                    break
+            if not in_cluster:
+                deps = sorted(self.dependencies.get(svc, set()))
+                label_parts = [svc]
+                config = self.services[svc]
+                if 'image' in config:
+                    label_parts.append(f"image: {config['image']}")
+                elif 'build' in config:
+                    label_parts.append(f"build: {config['build'] if isinstance(config['build'], str) else './...'}")
+                label = '\\n'.join(label_parts)
+                lines.append(f'    "{svc}" [label="{label}"];')
+
+        # 更新cluster中节点的标签（带image/build信息）
+        for svc in sorted(self.services.keys()):
             label_parts = [svc]
             config = self.services[svc]
             if 'image' in config:

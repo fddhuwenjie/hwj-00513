@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  frontend:
+    image: nginx:1.25-alpine
+    container_name: netonly_frontend
+    ports:
+      - "80:80"
+    networks:
+      - app-network
+
+  backend:
+    image: node:20-alpine
+    container_name: netonly_backend
+    command: node server.js
+    networks:
+      - app-network
+
+  database:
+    image: postgres:16-alpine
+    container_name: netonly_db
+    networks:
+      - app-network
+
+  cache:
+    image: redis:7-alpine
+    container_name: netonly_cache
+    networks:
+      - app-network
+
+  logger:
+    image: busybox
+    container_name: netonly_logger
+    command: tail -f /dev/null
+    networks:
+      - monitoring
+
+  metrics:
+    image: busybox
+    container_name: netonly_metrics
+    command: tail -f /dev/null
+    networks:
+      - monitoring
+
+networks:
+  app-network:
+    driver: bridge
+  monitoring:
+    driver: bridge
