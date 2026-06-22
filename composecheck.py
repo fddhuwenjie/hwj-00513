@@ -1338,7 +1338,7 @@ class ComposeDiffEngine:
         base_major, base_minor = self._parse_version(base_tag)
         target_major, target_minor = self._parse_version(target_tag)
 
-        is_db = any(base_name.lower().startswith(p) for p in self.DB_IMAGE_PREFIXES)
+        is_db = self._is_db_image(base_name)
 
         if is_db and base_major is not None and target_major is not None and base_major != target_major:
             return [self._change(
@@ -1709,36 +1709,42 @@ class ComposeDiffEngine:
         base_rp = (base_deploy.get('restart_policy', {}) or {}).get('condition')
         target_rp = (target_deploy.get('restart_policy', {}) or {}).get('condition')
 
-        base_has = base_restart is not None or base_rp is not None
-        target_has = target_restart is not None or target_rp is not None
+        base_effective = self._effective_restart(base_restart, base_rp)
+        target_effective = self._effective_restart(target_restart, target_rp)
 
-        if base_restart == target_restart and base_rp == target_rp:
+        if base_effective == target_effective and base_restart == target_restart and base_rp == target_rp:
             return []
 
         changes: List[Dict[str, Any]] = []
 
-        if base_has and not target_has:
+        was_auto = base_effective
+        is_now_auto = target_effective
+
+        if was_auto and not is_now_auto:
             changes.append(self._change(
-                service=svc, field='restart', change_type='removed',
-                old_value=base_restart or base_rp, new_value=None,
+                service=svc, field='restart', change_type='modified',
+                old_value=base_restart or base_rp or '默认',
+                new_value=target_restart or target_rp or '未设置',
                 risk_level='high',
-                risk_reason='取消 restart 策略，容器异常退出后不会自动重启',
-                impact=f'服务 {svc} 不再有自动重启策略，故障时无法自动恢复',
-                suggestion='设置 restart: unless-stopped 或 on-failure 策略',
+                risk_reason='取消 restart 策略（显式 no 或移除策略），容器异常退出后不会自动重启',
+                impact=f'服务 {svc} 从自动重启变为不重启策略，故障时无法自动恢复',
+                suggestion='设置 restart: unless-stopped 或 on-failure 策略，保证服务可靠性',
             ))
-        elif not base_has and target_has:
+        elif not was_auto and is_now_auto:
             changes.append(self._change(
-                service=svc, field='restart', change_type='added',
-                old_value=None, new_value=target_restart or target_rp,
+                service=svc, field='restart', change_type='modified',
+                old_value=base_restart or base_rp or '未设置',
+                new_value=target_restart or target_rp,
                 risk_level='none',
-                risk_reason='新增 restart 策略，提升服务可靠性',
-                impact=f'服务 {svc} 新增重启策略',
+                risk_reason='启用 restart 策略，提升服务可靠性',
+                impact=f'服务 {svc} 启用自动重启策略',
                 suggestion='确认策略符合业务需求',
             ))
         else:
             changes.append(self._change(
                 service=svc, field='restart', change_type='modified',
-                old_value=base_restart or base_rp, new_value=target_restart or target_rp,
+                old_value=base_restart or base_rp,
+                new_value=target_restart or target_rp,
                 risk_level='low',
                 risk_reason='restart 策略变更',
                 impact=f'服务 {svc} 的重启策略已修改',
@@ -1746,6 +1752,19 @@ class ComposeDiffEngine:
             ))
 
         return changes
+
+    @staticmethod
+    def _effective_restart(restart_val: Any, restart_policy_cond: Any) -> bool:
+        if restart_val is None:
+            if restart_policy_cond is None:
+                return False
+            return str(restart_policy_cond).lower() not in ('no', 'none', 'false', '')
+        if isinstance(restart_val, bool):
+            return bool(restart_val)
+        sv = str(restart_val).strip().lower()
+        if sv in ('no', 'none', 'false', '0', ''):
+            return False
+        return True
 
     def _diff_top_level(self, kind: str, base: Dict[str, Any], target: Dict[str, Any]) -> List[Dict[str, Any]]:
         changes: List[Dict[str, Any]] = []
@@ -1784,6 +1803,20 @@ class ComposeDiffEngine:
                 ))
 
         return changes
+
+    @classmethod
+    def _is_db_image(cls, image_name: str) -> bool:
+        if not image_name:
+            return False
+        candidates = [image_name.lower()]
+        if '/' in image_name:
+            last_segment = image_name.rsplit('/', 1)[-1].lower()
+            candidates.append(last_segment)
+        for candidate in candidates:
+            for prefix in cls.DB_IMAGE_PREFIXES:
+                if candidate.startswith(prefix):
+                    return True
+        return False
 
     @staticmethod
     def _split_image(image: str) -> Tuple[str, str]:

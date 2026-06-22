@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  app:
+    image: nginx:1.25-alpine
+    ports:
+      - "80:80"
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  db:
+    image: bitnami/postgresql:16
+    volumes:
+      - postgres_data:/bitnami/postgresql
+    restart: "no"
+    environment:
+      POSTGRESQL_USERNAME: bn_user
+      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRESQL_DATABASE: appdb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bn_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  default:
+    driver: bridge
+
+volumes:
+  postgres_data:
