@@ -10,6 +10,7 @@ import sys
 from collections import defaultdict, deque
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import json
 import yaml
 
 
@@ -1184,7 +1185,891 @@ class ResourceEstimator:
 
 
 # =============================================================================
-# 6. 报告与修复建议模块
+# 6. 配置差异对比与升级风险评估模块
+# =============================================================================
+
+class ComposeDiffEngine:
+    """Compose 配置差异对比引擎，复用现有解析与检查模块"""
+
+    DB_IMAGE_PREFIXES = [
+        'mysql', 'postgres', 'mariadb', 'mongo', 'redis',
+        'couchdb', 'cassandra', 'neo4j', 'influxdb',
+        'timescaledb', 'cockroachdb', 'yugabytedb',
+    ]
+
+    def __init__(self, base_parser: ComposeParser, target_parser: ComposeParser):
+        self.base_parser = base_parser
+        self.target_parser = target_parser
+        self.base_services = base_parser.get_services()
+        self.target_services = target_parser.get_services()
+        self.base_networks = base_parser.get_networks()
+        self.target_networks = target_parser.get_networks()
+        self.base_volumes = base_parser.get_volumes()
+        self.target_volumes = target_parser.get_volumes()
+
+    def diff(self) -> Dict[str, Any]:
+        base_names = set(self.base_services.keys())
+        target_names = set(self.target_services.keys())
+
+        added_services = sorted(target_names - base_names)
+        removed_services = sorted(base_names - target_names)
+        common_services = sorted(base_names & target_names)
+
+        service_diffs: Dict[str, List[Dict[str, Any]]] = {}
+
+        for svc in added_services:
+            service_diffs[svc] = [self._service_added_change(svc)]
+
+        for svc in removed_services:
+            service_diffs[svc] = [self._service_removed_change(svc)]
+
+        for svc in common_services:
+            changes = self._diff_service(svc, self.base_services[svc], self.target_services[svc])
+            if changes:
+                service_diffs[svc] = changes
+
+        network_diffs = self._diff_top_level('networks', self.base_networks, self.target_networks)
+        volume_diffs = self._diff_top_level('volumes', self.base_volumes, self.target_volumes)
+
+        all_changes = []
+        for changes in service_diffs.values():
+            all_changes.extend(changes)
+        all_changes.extend(network_diffs)
+        all_changes.extend(volume_diffs)
+
+        risk_counts: Dict[str, int] = defaultdict(int)
+        high_risk_services: List[str] = []
+        for c in all_changes:
+            rl = c.get('risk_level', 'none')
+            if rl != 'none':
+                risk_counts[rl] += 1
+            if rl in ('high', 'critical'):
+                svc = c.get('service', '')
+                if svc and svc not in high_risk_services:
+                    high_risk_services.append(svc)
+
+        return {
+            'base_services': sorted(base_names),
+            'target_services': sorted(target_names),
+            'added_services': added_services,
+            'removed_services': removed_services,
+            'service_diffs': service_diffs,
+            'network_diffs': network_diffs,
+            'volume_diffs': volume_diffs,
+            'summary': {
+                'total_changes': len(all_changes),
+                'risk_counts': dict(risk_counts),
+                'high_risk_services': high_risk_services,
+            },
+        }
+
+    @staticmethod
+    def _change(service: str, field: str, change_type: str,
+                old_value: Any, new_value: Any,
+                risk_level: str = 'none', risk_reason: str = '',
+                impact: str = '', suggestion: str = '') -> Dict[str, Any]:
+        return {
+            'service': service,
+            'field': field,
+            'change_type': change_type,
+            'old_value': old_value,
+            'new_value': new_value,
+            'risk_level': risk_level,
+            'risk_reason': risk_reason,
+            'impact': impact,
+            'suggestion': suggestion,
+        }
+
+    def _service_added_change(self, svc: str) -> Dict[str, Any]:
+        config = self.target_services[svc]
+        image = config.get('image', config.get('build', '未知'))
+        return self._change(
+            service=svc, field='service', change_type='added',
+            old_value=None, new_value=image,
+            risk_level='low',
+            risk_reason='新增服务可能引入未知依赖或攻击面',
+            impact=f'新增服务 {svc}（{image}），需验证其安全性与依赖关系',
+            suggestion='确认新服务的必要性，检查其镜像来源、网络暴露和资源限制',
+        )
+
+    def _service_removed_change(self, svc: str) -> Dict[str, Any]:
+        config = self.base_services[svc]
+        image = config.get('image', config.get('build', '未知'))
+        return self._change(
+            service=svc, field='service', change_type='removed',
+            old_value=image, new_value=None,
+            risk_level='medium',
+            risk_reason='删除服务可能影响依赖它的其他服务',
+            impact=f'删除服务 {svc}（{image}），依赖此服务的组件将不可用',
+            suggestion='确认无其他服务依赖此服务后再移除，或保留占位配置',
+        )
+
+    def _diff_service(self, svc: str, base_cfg: Dict[str, Any], target_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        changes: List[Dict[str, Any]] = []
+        changes.extend(self._diff_image(svc, base_cfg, target_cfg))
+        changes.extend(self._diff_ports(svc, base_cfg, target_cfg))
+        changes.extend(self._diff_environment(svc, base_cfg, target_cfg))
+        changes.extend(self._diff_networks(svc, base_cfg, target_cfg))
+        changes.extend(self._diff_volumes(svc, base_cfg, target_cfg))
+        changes.extend(self._diff_resources(svc, base_cfg, target_cfg))
+        changes.extend(self._diff_healthcheck(svc, base_cfg, target_cfg))
+        changes.extend(self._diff_restart(svc, base_cfg, target_cfg))
+        return changes
+
+    def _diff_image(self, svc: str, base_cfg: Dict[str, Any], target_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        base_img = base_cfg.get('image', '')
+        target_img = target_cfg.get('image', '')
+        if base_img == target_img:
+            return []
+
+        base_name, base_tag = self._split_image(base_img)
+        target_name, target_tag = self._split_image(target_img)
+
+        if base_name != target_name:
+            return [self._change(
+                service=svc, field='image', change_type='modified',
+                old_value=base_img, new_value=target_img,
+                risk_level='high',
+                risk_reason='镜像名称变更，可能导致服务行为完全不同',
+                impact=f'服务 {svc} 镜像从 {base_img} 变为 {target_img}，功能可能不兼容',
+                suggestion='验证新镜像的兼容性，确认配置和环境变量是否仍然适用',
+            )]
+
+        base_major, base_minor = self._parse_version(base_tag)
+        target_major, target_minor = self._parse_version(target_tag)
+
+        is_db = any(base_name.lower().startswith(p) for p in self.DB_IMAGE_PREFIXES)
+
+        if is_db and base_major is not None and target_major is not None and base_major != target_major:
+            return [self._change(
+                service=svc, field='image', change_type='modified',
+                old_value=base_img, new_value=target_img,
+                risk_level='critical',
+                risk_reason=f'数据库镜像大版本升级（{base_tag} → {target_tag}），可能存在不兼容的变更',
+                impact=f'服务 {svc} 数据库从 {base_img} 升级到 {target_img}，数据迁移可能失败',
+                suggestion='先在测试环境验证升级，备份数据，阅读官方升级文档中的 Breaking Changes',
+            )]
+
+        if base_major is not None and target_major is not None:
+            if base_major != target_major:
+                risk = 'high' if is_db else 'medium'
+                reason = '大版本升级，可能存在 Breaking Changes'
+                if is_db:
+                    reason = '数据库镜像大版本升级，需关注兼容性'
+            elif base_minor is not None and target_minor is not None and base_minor != target_minor:
+                risk = 'medium' if is_db else 'low'
+                reason = '小版本升级，通常向后兼容但建议验证'
+                if is_db:
+                    reason = '数据库小版本升级，建议检查 Release Notes'
+            else:
+                risk = 'low'
+                reason = '补丁版本或标签变更，风险较低'
+        else:
+            risk = 'medium'
+            reason = '版本标签变更，无法精确判断兼容性'
+
+        return [self._change(
+            service=svc, field='image', change_type='modified',
+            old_value=base_img, new_value=target_img,
+            risk_level=risk, risk_reason=reason,
+            impact=f'服务 {svc} 镜像从 {base_img} 变为 {target_img}',
+            suggestion='确认版本变更的兼容性，查阅 Release Notes',
+        )]
+
+    def _diff_ports(self, svc: str, base_cfg: Dict[str, Any], target_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        base_ports_raw = base_cfg.get('ports', []) or []
+        target_ports_raw = target_cfg.get('ports', []) or []
+
+        base_parsed = self._parse_all_ports(base_ports_raw)
+        target_parsed = self._parse_all_ports(target_ports_raw)
+
+        changes: List[Dict[str, Any]] = []
+
+        base_set = {(p['host_ip'], p['published'], p['target'], p['protocol']) for p in base_parsed}
+        target_set = {(p['host_ip'], p['published'], p['target'], p['protocol']) for p in target_parsed}
+
+        added_ports = target_set - base_set
+        removed_ports = base_set - target_set
+
+        for ap in sorted(added_ports):
+            host_ip, published, target_port, proto = ap
+            is_exposed = host_ip == '0.0.0.0' and published > 0
+            risk = 'medium' if is_exposed else 'low'
+            reason = '新增端口暴露到所有网络接口' if is_exposed else '新增端口映射'
+            change = self._change(
+                service=svc, field='ports', change_type='added',
+                old_value=None, new_value=f"{host_ip}:{published}->{target_port}/{proto}",
+                risk_level=risk, risk_reason=reason,
+                impact=f'服务 {svc} 新增端口映射 {host_ip}:{published}->{target_port}/{proto}',
+                suggestion='确认新端口是否必要，限制 host_ip 为 127.0.0.1 如仅本机访问',
+            )
+            changes.append(change)
+
+        for rp in sorted(removed_ports):
+            host_ip, published, target_port, proto = rp
+            change = self._change(
+                service=svc, field='ports', change_type='removed',
+                old_value=f"{host_ip}:{published}->{target_port}/{proto}", new_value=None,
+                risk_level='low',
+                risk_reason='移除端口映射，可能影响外部访问',
+                impact=f'服务 {svc} 移除端口映射 {host_ip}:{published}->{target_port}/{proto}',
+                suggestion='确认无外部依赖此端口后再移除',
+            )
+            changes.append(change)
+
+        base_published = {p['published'] for p in base_parsed if p['host_ip'] == '0.0.0.0'}
+        target_published = {p['published'] for p in target_parsed if p['host_ip'] == '0.0.0.0'}
+        expanded = target_published - base_published
+        has_wildcard_old = any(p['published'] > 0 and p['host_ip'] == '0.0.0.0' for p in base_parsed)
+
+        if expanded and has_wildcard_old:
+            for ch in changes:
+                if ch['field'] == 'ports' and ch['change_type'] == 'added':
+                    ch['risk_level'] = 'high'
+                    ch['risk_reason'] = '端口暴露范围扩大，增加攻击面'
+                    ch['suggestion'] = '最小化端口暴露，使用防火墙规则限制访问来源'
+
+        return changes
+
+    def _diff_environment(self, svc: str, base_cfg: Dict[str, Any], target_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        base_env = self._normalize_env(base_cfg.get('environment', {}))
+        target_env = self._normalize_env(target_cfg.get('environment', {}))
+
+        changes: List[Dict[str, Any]] = []
+
+        all_keys = sorted(set(base_env.keys()) | set(target_env.keys()))
+        for key in all_keys:
+            base_val = base_env.get(key)
+            target_val = target_env.get(key)
+
+            if key not in base_env:
+                is_sensitive = any(kw in key.lower() for kw in RiskChecker.PASSWORD_KEYWORDS)
+                is_plaintext = (target_val is not None
+                                and isinstance(target_val, str)
+                                and not target_val.startswith('${'))
+                if is_sensitive and is_plaintext:
+                    change = self._change(
+                        service=svc, field='environment', change_type='added',
+                        old_value=None, new_value=f'{key}=***',
+                        risk_level='high',
+                        risk_reason=f'新增明文敏感环境变量 {key}',
+                        impact=f'服务 {svc} 新增敏感变量 {key} 的明文值，存在泄露风险',
+                        suggestion=f'使用 Docker Secrets 或 .env 引用（如 ${{{key}}}）代替硬编码',
+                    )
+                else:
+                    change = self._change(
+                        service=svc, field='environment', change_type='added',
+                        old_value=None, new_value=f'{key}=***' if is_sensitive else f'{key}={target_val}',
+                        risk_level='low',
+                        risk_reason='新增环境变量',
+                        impact=f'服务 {svc} 新增环境变量 {key}',
+                        suggestion='确认新变量的必要性',
+                    )
+                changes.append(change)
+            elif key not in target_env:
+                is_sensitive = any(kw in key.lower() for kw in RiskChecker.PASSWORD_KEYWORDS)
+                change = self._change(
+                    service=svc, field='environment', change_type='removed',
+                    old_value=f'{key}=***' if is_sensitive else f'{key}={base_val}',
+                    new_value=None,
+                    risk_level='medium' if is_sensitive else 'low',
+                    risk_reason='删除敏感环境变量可能导致服务启动失败' if is_sensitive else '删除环境变量',
+                    impact=f'服务 {svc} 删除环境变量 {key}',
+                    suggestion='确认服务不再需要此变量',
+                )
+                changes.append(change)
+            elif base_val != target_val:
+                is_sensitive = any(kw in key.lower() for kw in RiskChecker.PASSWORD_KEYWORDS)
+                was_secret = isinstance(base_val, str) and base_val.startswith('${')
+                now_plaintext = isinstance(target_val, str) and not target_val.startswith('${')
+                if is_sensitive and was_secret and now_plaintext:
+                    change = self._change(
+                        service=svc, field='environment', change_type='modified',
+                        old_value=f'{key}=<引用>', new_value=f'{key}=***',
+                        risk_level='critical',
+                        risk_reason=f'敏感变量 {key} 从安全引用变更为明文硬编码',
+                        impact=f'服务 {svc} 的 {key} 变为明文存储，存在严重泄露风险',
+                        suggestion=f'立即将 {key} 改回 ${{{key}}} 引用形式，使用 .env 或 Secrets 管理',
+                    )
+                elif is_sensitive:
+                    change = self._change(
+                        service=svc, field='environment', change_type='modified',
+                        old_value=f'{key}=***', new_value=f'{key}=***',
+                        risk_level='medium',
+                        risk_reason=f'敏感变量 {key} 值发生变更',
+                        impact=f'服务 {svc} 的 {key} 已更新',
+                        suggestion='确认新值的安全性，避免硬编码',
+                    )
+                else:
+                    change = self._change(
+                        service=svc, field='environment', change_type='modified',
+                        old_value=f'{key}={base_val}', new_value=f'{key}={target_val}',
+                        risk_level='low',
+                        risk_reason='环境变量值变更',
+                        impact=f'服务 {svc} 的环境变量 {key} 值发生变更',
+                        suggestion='确认新值是否正确',
+                    )
+                changes.append(change)
+
+        return changes
+
+    def _diff_networks(self, svc: str, base_cfg: Dict[str, Any], target_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        base_nets = self._extract_network_set(base_cfg.get('networks'))
+        target_nets = self._extract_network_set(target_cfg.get('networks'))
+
+        changes: List[Dict[str, Any]] = []
+
+        added = target_nets - base_nets
+        removed = base_nets - target_nets
+
+        for net in sorted(added):
+            changes.append(self._change(
+                service=svc, field='networks', change_type='added',
+                old_value=None, new_value=net,
+                risk_level='medium',
+                risk_reason=f'新增网络 {net}，可能扩大服务的通信范围',
+                impact=f'服务 {svc} 加入网络 {net}，可与新网络中的服务通信',
+                suggestion='确认服务是否需要加入此网络，遵循最小权限原则',
+            ))
+
+        for net in sorted(removed):
+            changes.append(self._change(
+                service=svc, field='networks', change_type='removed',
+                old_value=net, new_value=None,
+                risk_level='medium',
+                risk_reason=f'移除网络 {net}，可能中断服务间通信',
+                impact=f'服务 {svc} 从网络 {net} 中移除，依赖此网络路径的服务将不可达',
+                suggestion='确认无其他服务通过此网络依赖此服务',
+            ))
+
+        return changes
+
+    def _diff_volumes(self, svc: str, base_cfg: Dict[str, Any], target_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        base_vols = self._normalize_volumes(base_cfg.get('volumes', []) or [])
+        target_vols = self._normalize_volumes(target_cfg.get('volumes', []) or [])
+
+        changes: List[Dict[str, Any]] = []
+
+        base_targets = {v['target']: v for v in base_vols}
+        target_targets = {v['target']: v for v in target_vols}
+
+        all_targets = sorted(set(base_targets.keys()) | set(target_targets.keys()))
+        for target in all_targets:
+            if target not in base_targets:
+                change = self._change(
+                    service=svc, field='volumes', change_type='added',
+                    old_value=None, new_value=target,
+                    risk_level='low',
+                    risk_reason='新增卷挂载',
+                    impact=f'服务 {svc} 新增挂载 {target}',
+                    suggestion='确认挂载源的安全性',
+                )
+                changes.append(change)
+            elif target not in target_targets:
+                bv = base_targets[target]
+                is_named = bv.get('is_named', False)
+                is_persistent = bv.get('is_persistent', False)
+                if is_named and is_persistent:
+                    change = self._change(
+                        service=svc, field='volumes', change_type='removed',
+                        old_value=target, new_value=None,
+                        risk_level='critical',
+                        risk_reason='删除持久化命名卷，数据将丢失',
+                        impact=f'服务 {svc} 删除持久化卷挂载 {target}，未迁移的数据将永久丢失',
+                        suggestion='先备份数据，确认数据已迁移或有其他持久化方案',
+                    )
+                else:
+                    change = self._change(
+                        service=svc, field='volumes', change_type='removed',
+                        old_value=target, new_value=None,
+                        risk_level='medium',
+                        risk_reason='删除卷挂载，可能影响服务运行',
+                        impact=f'服务 {svc} 删除挂载 {target}',
+                        suggestion='确认服务不再需要此挂载',
+                    )
+                changes.append(change)
+            else:
+                bv = base_targets[target]
+                tv = target_targets[target]
+                if bv.get('source') != tv.get('source'):
+                    changes.append(self._change(
+                        service=svc, field='volumes', change_type='modified',
+                        old_value=f"{bv.get('source')}:{target}", new_value=f"{tv.get('source')}:{target}",
+                        risk_level='low',
+                        risk_reason='卷挂载源变更',
+                        impact=f'服务 {svc} 的挂载 {target} 源路径变更',
+                        suggestion='确认新路径下的数据一致性',
+                    ))
+
+        return changes
+
+    def _diff_resources(self, svc: str, base_cfg: Dict[str, Any], target_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        base_deploy = base_cfg.get('deploy', {}) or {}
+        target_deploy = target_cfg.get('deploy', {}) or {}
+        base_res = base_deploy.get('resources', {}) or {}
+        target_res = target_deploy.get('resources', {}) or {}
+
+        changes: List[Dict[str, Any]] = []
+
+        for scope in ('limits', 'reservations'):
+            base_scope = base_res.get(scope, {}) or {}
+            target_scope = target_res.get(scope, {}) or {}
+
+            for resource_type in ('cpus', 'memory'):
+                base_val = base_scope.get(resource_type)
+                target_val = target_scope.get(resource_type)
+
+                if base_val is None and target_val is not None:
+                    changes.append(self._change(
+                        service=svc, field=f'deploy.resources.{scope}.{resource_type}',
+                        change_type='added', old_value=None, new_value=str(target_val),
+                        risk_level='low',
+                        risk_reason=f'新增资源{scope[:-1]} {resource_type}',
+                        impact=f'服务 {svc} 新增 {scope} {resource_type}: {target_val}',
+                        suggestion='确认资源限制合理',
+                    ))
+                elif base_val is not None and target_val is None:
+                    changes.append(self._change(
+                        service=svc, field=f'deploy.resources.{scope}.{resource_type}',
+                        change_type='removed', old_value=str(base_val), new_value=None,
+                        risk_level='high' if scope == 'limits' else 'medium',
+                        risk_reason=f'移除资源{scope[:-1]}，服务可能无限制地消耗资源' if scope == 'limits' else f'移除资源预留 {resource_type}',
+                        impact=f'服务 {svc} 移除 {scope} {resource_type}',
+                        suggestion='建议保留资源限制以防止资源耗尽' if scope == 'limits' else '确认调度策略仍可满足需求',
+                    ))
+                elif base_val is not None and target_val is not None and base_val != target_val:
+                    if resource_type == 'memory':
+                        base_mb = ResourceEstimator.parse_memory(base_val)
+                        target_mb = ResourceEstimator.parse_memory(target_val)
+                        increased = target_mb is not None and base_mb is not None and target_mb > base_mb
+                    else:
+                        base_cpu = ResourceEstimator.parse_cpu(base_val)
+                        target_cpu = ResourceEstimator.parse_cpu(target_val)
+                        increased = target_cpu is not None and base_cpu is not None and target_cpu > base_cpu
+
+                    risk = 'medium' if (scope == 'limits' and increased) else 'low'
+                    reason = f'资源{scope[:-1]} {"增加" if increased else "减少"}'
+                    if scope == 'limits' and increased:
+                        reason += '，需确保宿主机有足够资源'
+
+                    changes.append(self._change(
+                        service=svc, field=f'deploy.resources.{scope}.{resource_type}',
+                        change_type='modified', old_value=str(base_val), new_value=str(target_val),
+                        risk_level=risk, risk_reason=reason,
+                        impact=f'服务 {svc} {scope} {resource_type}: {base_val} → {target_val}',
+                        suggestion='评估资源变更是否与实际需求匹配',
+                    ))
+
+        return changes
+
+    def _diff_healthcheck(self, svc: str, base_cfg: Dict[str, Any], target_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        base_hc = base_cfg.get('healthcheck')
+        target_hc = target_cfg.get('healthcheck')
+
+        if base_hc == target_hc:
+            return []
+
+        changes: List[Dict[str, Any]] = []
+
+        if base_hc and not target_hc:
+            changes.append(self._change(
+                service=svc, field='healthcheck', change_type='removed',
+                old_value=str(base_hc), new_value=None,
+                risk_level='high',
+                risk_reason='移除 healthcheck，容器异常时无法自动检测和恢复',
+                impact=f'服务 {svc} 不再有健康检查，异常状态无法被编排器感知',
+                suggestion='保留或配置 healthcheck 以确保服务可用性监控',
+            ))
+        elif not base_hc and target_hc:
+            changes.append(self._change(
+                service=svc, field='healthcheck', change_type='added',
+                old_value=None, new_value=str(target_hc),
+                risk_level='none',
+                risk_reason='新增 healthcheck，提升服务可观测性',
+                impact=f'服务 {svc} 新增健康检查',
+                suggestion='确认 healthcheck 配置正确',
+            ))
+        else:
+            changes.append(self._change(
+                service=svc, field='healthcheck', change_type='modified',
+                old_value=str(base_hc), new_value=str(target_hc),
+                risk_level='low',
+                risk_reason='healthcheck 配置变更',
+                impact=f'服务 {svc} 的健康检查配置已修改',
+                suggestion='验证新的 healthcheck 参数是否合理',
+            ))
+
+        return changes
+
+    def _diff_restart(self, svc: str, base_cfg: Dict[str, Any], target_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        base_restart = base_cfg.get('restart')
+        target_restart = target_cfg.get('restart')
+        base_deploy = base_cfg.get('deploy', {}) or {}
+        target_deploy = target_cfg.get('deploy', {}) or {}
+        base_rp = (base_deploy.get('restart_policy', {}) or {}).get('condition')
+        target_rp = (target_deploy.get('restart_policy', {}) or {}).get('condition')
+
+        base_has = base_restart is not None or base_rp is not None
+        target_has = target_restart is not None or target_rp is not None
+
+        if base_restart == target_restart and base_rp == target_rp:
+            return []
+
+        changes: List[Dict[str, Any]] = []
+
+        if base_has and not target_has:
+            changes.append(self._change(
+                service=svc, field='restart', change_type='removed',
+                old_value=base_restart or base_rp, new_value=None,
+                risk_level='high',
+                risk_reason='取消 restart 策略，容器异常退出后不会自动重启',
+                impact=f'服务 {svc} 不再有自动重启策略，故障时无法自动恢复',
+                suggestion='设置 restart: unless-stopped 或 on-failure 策略',
+            ))
+        elif not base_has and target_has:
+            changes.append(self._change(
+                service=svc, field='restart', change_type='added',
+                old_value=None, new_value=target_restart or target_rp,
+                risk_level='none',
+                risk_reason='新增 restart 策略，提升服务可靠性',
+                impact=f'服务 {svc} 新增重启策略',
+                suggestion='确认策略符合业务需求',
+            ))
+        else:
+            changes.append(self._change(
+                service=svc, field='restart', change_type='modified',
+                old_value=base_restart or base_rp, new_value=target_restart or target_rp,
+                risk_level='low',
+                risk_reason='restart 策略变更',
+                impact=f'服务 {svc} 的重启策略已修改',
+                suggestion='确认新策略是否满足可靠性需求',
+            ))
+
+        return changes
+
+    def _diff_top_level(self, kind: str, base: Dict[str, Any], target: Dict[str, Any]) -> List[Dict[str, Any]]:
+        changes: List[Dict[str, Any]] = []
+        base_names = set(base.keys())
+        target_names = set(target.keys())
+
+        for name in sorted(target_names - base_names):
+            changes.append(self._change(
+                service='', field=kind, change_type='added',
+                old_value=None, new_value=name,
+                risk_level='low',
+                risk_reason=f'新增{kind[:-1] if kind.endswith("s") else kind} {name}',
+                impact=f'新增{kind[:-1] if kind.endswith("s") else kind} {name}',
+                suggestion=f'确认{kind[:-1] if kind.endswith("s") else kind}配置正确',
+            ))
+
+        for name in sorted(base_names - target_names):
+            changes.append(self._change(
+                service='', field=kind, change_type='removed',
+                old_value=name, new_value=None,
+                risk_level='medium',
+                risk_reason=f'删除{kind[:-1] if kind.endswith("s") else kind} {name}，相关服务可能受影响',
+                impact=f'删除{kind[:-1] if kind.endswith("s") else kind} {name}',
+                suggestion=f'确认无服务依赖此{kind[:-1] if kind.endswith("s") else kind}',
+            ))
+
+        for name in sorted(base_names & target_names):
+            if base[name] != target[name]:
+                changes.append(self._change(
+                    service='', field=kind, change_type='modified',
+                    old_value=str(base[name]), new_value=str(target[name]),
+                    risk_level='low',
+                    risk_reason=f'{kind[:-1] if kind.endswith("s") else kind} {name} 配置变更',
+                    impact=f'{kind[:-1] if kind.endswith("s") else kind} {name} 配置已修改',
+                    suggestion=f'检查{kind[:-1] if kind.endswith("s") else kind}变更的影响',
+                ))
+
+        return changes
+
+    @staticmethod
+    def _split_image(image: str) -> Tuple[str, str]:
+        if not image:
+            return ('', '')
+        if '/' in image and ':' in image:
+            tag_idx = image.rfind(':')
+            slash_idx = image.rfind('/')
+            if tag_idx > slash_idx:
+                return (image[:tag_idx], image[tag_idx + 1:])
+            return (image, 'latest')
+        if ':' in image:
+            name, tag = image.rsplit(':', 1)
+            return (name, tag)
+        return (image, 'latest')
+
+    @staticmethod
+    def _parse_version(tag: str) -> Tuple[Optional[int], Optional[int]]:
+        if not tag or tag == 'latest':
+            return (None, None)
+        clean = tag.split('-')[0]
+        parts = clean.split('.')
+        try:
+            major = int(parts[0])
+            minor = int(parts[1]) if len(parts) > 1 else None
+            return (major, minor)
+        except (ValueError, IndexError):
+            return (None, None)
+
+    @staticmethod
+    def _parse_all_ports(ports_raw: List[Any]) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        for p in ports_raw:
+            results.extend(PortChecker.parse_port_mapping(p))
+        return results
+
+    @staticmethod
+    def _normalize_env(env: Any) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        if isinstance(env, dict):
+            return dict(env)
+        if isinstance(env, list):
+            for item in env:
+                if isinstance(item, str) and '=' in item:
+                    k, v = item.split('=', 1)
+                    result[k] = v
+                elif isinstance(item, dict):
+                    result.update(item)
+        return result
+
+    @staticmethod
+    def _extract_network_set(networks_config: Any) -> Set[str]:
+        return set(DependencyAnalyzer._extract_network_names(networks_config))
+
+    @staticmethod
+    def _normalize_volumes(volumes: List[Any]) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        for vol in volumes:
+            if isinstance(vol, str):
+                parts = vol.split(':')
+                source = parts[0] if len(parts) >= 2 else ''
+                target = parts[1] if len(parts) >= 2 else parts[0]
+                is_named = not source.startswith('.') and not source.startswith('/') and source != '' and len(parts) >= 2
+                is_persistent = is_named
+                result.append({'source': source, 'target': target, 'is_named': is_named, 'is_persistent': is_persistent})
+            elif isinstance(vol, dict):
+                source = vol.get('source', '')
+                target = vol.get('target', '')
+                vtype = vol.get('type', 'volume')
+                is_named = vtype == 'volume' and bool(source)
+                is_persistent = is_named
+                result.append({'source': source, 'target': target, 'is_named': is_named, 'is_persistent': is_persistent})
+        return result
+
+
+class DiffReportGenerator:
+    """差异对比报告生成器，支持 Markdown 和 JSON 格式"""
+
+    RISK_ICONS = {
+        'critical': '🔴',
+        'high': '🟠',
+        'medium': '🟡',
+        'low': '🔵',
+        'none': '⚪',
+    }
+
+    RISK_LABELS = {
+        'critical': '严重',
+        'high': '高危',
+        'medium': '中危',
+        'low': '低危',
+        'none': '无风险',
+    }
+
+    def __init__(self, diff_result: Dict[str, Any], base_files: List[str], target_files: List[str]):
+        self.diff_result = diff_result
+        self.base_files = base_files
+        self.target_files = target_files
+
+    def generate_markdown(self) -> str:
+        md: List[str] = []
+        d = self.diff_result
+
+        md.append("# Docker Compose 配置差异对比报告")
+        md.append("")
+        from datetime import datetime
+        md.append(f"> 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        md.append(f"> 基准配置: {', '.join(self.base_files)}")
+        md.append(f"> 目标配置: {', '.join(self.target_files)}")
+        md.append("")
+
+        md.append("## 📋 差异概览")
+        md.append("")
+        summary = d['summary']
+        md.append("| 指标 | 数值 |")
+        md.append("|------|------|")
+        md.append(f"| 变更总数 | {summary['total_changes']} |")
+        for level in ('critical', 'high', 'medium', 'low'):
+            count = summary['risk_counts'].get(level, 0)
+            icon = self.RISK_ICONS[level]
+            md.append(f"| {icon} {self.RISK_LABELS[level]} | {count} |")
+        md.append(f"| 基准服务数 | {len(d['base_services'])} |")
+        md.append(f"| 目标服务数 | {len(d['target_services'])} |")
+        md.append(f"| 新增服务 | {len(d['added_services'])} |")
+        md.append(f"| 删除服务 | {len(d['removed_services'])} |")
+        md.append("")
+
+        if d['added_services']:
+            md.append("### ✅ 新增服务")
+            md.append("")
+            for svc in d['added_services']:
+                md.append(f"- `{svc}`")
+            md.append("")
+
+        if d['removed_services']:
+            md.append("### ❌ 删除服务")
+            md.append("")
+            for svc in d['removed_services']:
+                md.append(f"- `{svc}`")
+            md.append("")
+
+        md.append("## 📝 服务差异详情")
+        md.append("")
+
+        service_diffs = d['service_diffs']
+        if not service_diffs:
+            md.append("✅ 所有服务配置无差异")
+            md.append("")
+        else:
+            for svc in sorted(service_diffs.keys()):
+                changes = service_diffs[svc]
+                md.append(f"### 服务 `{svc}`")
+                md.append("")
+                md.append("| 字段 | 变更类型 | 旧值 | 新值 | 风险等级 | 风险原因 |")
+                md.append("|------|---------|------|------|---------|---------|")
+                for c in changes:
+                    field = c['field']
+                    ctype = c['change_type']
+                    old_v = self._truncate(str(c.get('old_value', '') or '-'), 40)
+                    new_v = self._truncate(str(c.get('new_value', '') or '-'), 40)
+                    risk = c.get('risk_level', 'none')
+                    icon = self.RISK_ICONS.get(risk, '⚪')
+                    reason = self._truncate(c.get('risk_reason', ''), 50)
+                    md.append(f"| {field} | {ctype} | {old_v} | {new_v} | {icon} {self.RISK_LABELS.get(risk, risk)} | {reason} |")
+                md.append("")
+
+                high_risk = [c for c in changes if c.get('risk_level') in ('critical', 'high')]
+                if high_risk:
+                    md.append("**⚠️ 高风险变更详情：**")
+                    md.append("")
+                    for c in high_risk:
+                        risk = c['risk_level']
+                        icon = self.RISK_ICONS[risk]
+                        md.append(f"- {icon} **{c['field']}**: {c.get('risk_reason', '')}")
+                        md.append(f"  - 影响范围: {c.get('impact', '')}")
+                        md.append(f"  - 建议处理: {c.get('suggestion', '')}")
+                    md.append("")
+
+        if d.get('network_diffs'):
+            md.append("## 🌐 网络差异")
+            md.append("")
+            for c in d['network_diffs']:
+                icon = self.RISK_ICONS.get(c.get('risk_level', 'none'), '⚪')
+                md.append(f"- {icon} [{c['change_type']}] {c.get('risk_reason', '')}")
+            md.append("")
+
+        if d.get('volume_diffs'):
+            md.append("## 💾 数据卷差异")
+            md.append("")
+            for c in d['volume_diffs']:
+                icon = self.RISK_ICONS.get(c.get('risk_level', 'none'), '⚪')
+                md.append(f"- {icon} [{c['change_type']}] {c.get('risk_reason', '')}")
+            md.append("")
+
+        md.append("## 💡 建议处理方式汇总")
+        md.append("")
+        all_changes = []
+        for changes in service_diffs.values():
+            all_changes.extend(changes)
+        all_changes.extend(d.get('network_diffs', []))
+        all_changes.extend(d.get('volume_diffs', []))
+
+        risky = [c for c in all_changes if c.get('risk_level') in ('critical', 'high')]
+        if risky:
+            for i, c in enumerate(risky, 1):
+                icon = self.RISK_ICONS[c['risk_level']]
+                svc_label = f"服务 `{c['service']}`" if c.get('service') else '全局'
+                md.append(f"{i}. {icon} {svc_label} - {c['field']}: {c.get('suggestion', '')}")
+            md.append("")
+        else:
+            md.append("✅ 未检测到高风险变更")
+            md.append("")
+
+        return "\n".join(md)
+
+    def generate_json(self) -> str:
+        output = {
+            'base_files': self.base_files,
+            'target_files': self.target_files,
+            'diff': self.diff_result,
+        }
+        return json.dumps(output, ensure_ascii=False, indent=2, default=str)
+
+    def format_console(self) -> str:
+        lines: List[str] = []
+        d = self.diff_result
+
+        lines.append("配置差异对比报告")
+        lines.append("=" * 70)
+        lines.append(f"基准: {', '.join(self.base_files)}")
+        lines.append(f"目标: {', '.join(self.target_files)}")
+        lines.append("")
+
+        summary = d['summary']
+        lines.append(f"变更总数: {summary['total_changes']}")
+        for level in ('critical', 'high', 'medium', 'low'):
+            count = summary['risk_counts'].get(level, 0)
+            if count:
+                icon = self.RISK_ICONS[level]
+                lines.append(f"  {icon} {self.RISK_LABELS[level]}: {count}")
+        lines.append("")
+
+        if d['added_services']:
+            lines.append("✅ 新增服务:")
+            for svc in d['added_services']:
+                lines.append(f"  + {svc}")
+            lines.append("")
+
+        if d['removed_services']:
+            lines.append("❌ 删除服务:")
+            for svc in d['removed_services']:
+                lines.append(f"  - {svc}")
+            lines.append("")
+
+        service_diffs = d['service_diffs']
+        if service_diffs:
+            for svc in sorted(service_diffs.keys()):
+                changes = service_diffs[svc]
+                lines.append(f"--- 服务: {svc} ---")
+                for c in changes:
+                    icon = self.RISK_ICONS.get(c.get('risk_level', 'none'), '⚪')
+                    ctype = c['change_type']
+                    field = c['field']
+                    old_v = self._truncate(str(c.get('old_value', '') or '-'), 30)
+                    new_v = self._truncate(str(c.get('new_value', '') or '-'), 30)
+                    lines.append(f"  {icon} [{ctype}] {field}: {old_v} → {new_v}")
+                    if c.get('risk_level') in ('critical', 'high') and c.get('risk_reason'):
+                        lines.append(f"     原因: {c['risk_reason']}")
+                        lines.append(f"     建议: {c.get('suggestion', '')}")
+                lines.append("")
+
+        if not service_diffs and not d['added_services'] and not d['removed_services']:
+            lines.append("✅ 两份配置无差异")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _truncate(s: str, max_len: int) -> str:
+        if len(s) <= max_len:
+            return s
+        return s[:max_len - 3] + '...'
+
+
+# =============================================================================
+# 7. 报告与修复建议模块
 # =============================================================================
 
 class ReportGenerator:
@@ -1728,6 +2613,46 @@ def cmd_resources(args):
     return 1 if analysis['over_threshold'] else 0
 
 
+def cmd_diff(args):
+    """diff 子命令：配置差异对比与升级风险评估"""
+    base_files = args.base
+    target_files = args.target
+
+    base_parser = ComposeParser()
+    base_parser.parse(base_files)
+
+    target_parser = ComposeParser()
+    target_parser.parse(target_files)
+
+    diff_engine = ComposeDiffEngine(base_parser, target_parser)
+    result = diff_engine.diff()
+
+    report_gen = DiffReportGenerator(result, base_files, target_files)
+
+    fmt = args.format
+    if fmt == 'console':
+        print(report_gen.format_console())
+    elif fmt == 'markdown':
+        md = report_gen.generate_markdown()
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(md)
+            print(f"✅ Markdown 报告已保存: {args.output}")
+        else:
+            print(md)
+    elif fmt == 'json':
+        j = report_gen.generate_json()
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(j)
+            print(f"✅ JSON 报告已保存: {args.output}")
+        else:
+            print(j)
+
+    has_high_risk = bool(result['summary']['high_risk_services'])
+    return 1 if has_high_risk else 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog='composecheck',
@@ -1741,6 +2666,9 @@ def main():
   python composecheck.py risks docker-compose.yml --fix
   python composecheck.py graph docker-compose.yml --format dot --output graph.dot
   python composecheck.py resources docker-compose.yml --cpu-threshold 8 --mem-threshold 16g
+  python composecheck.py diff --base docker-compose.yml --target docker-compose-v2.yml
+  python composecheck.py diff --base base.yml override.yml --target prod.yml --format markdown --output diff.md
+  python composecheck.py diff --base v1.yml --target v2.yml --format json
         """
     )
 
@@ -1784,6 +2712,13 @@ def main():
     resources_parser.add_argument('--cpu-threshold', type=float, help='CPU 阈值（核数），默认 4')
     resources_parser.add_argument('--mem-threshold', help='内存阈值（如 8g, 1024m），默认 8g')
 
+    # diff 子命令
+    diff_parser = subparsers.add_parser('diff', help='配置差异对比与升级风险评估')
+    diff_parser.add_argument('--base', nargs='+', required=True, help='基准 Compose 文件路径（可多个，按顺序合并）')
+    diff_parser.add_argument('--target', nargs='+', required=True, help='目标 Compose 文件路径（可多个，按顺序合并）')
+    diff_parser.add_argument('--format', choices=['console', 'markdown', 'json'], default='console', help='输出格式（默认 console）')
+    diff_parser.add_argument('--output', '-O', help='输出文件路径（markdown/json 格式时使用）')
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1801,6 +2736,8 @@ def main():
             return cmd_graph(args)
         elif args.command == 'resources':
             return cmd_resources(args)
+        elif args.command == 'diff':
+            return cmd_diff(args)
     except FileNotFoundError as e:
         print(f"❌ 错误: {e}", file=sys.stderr)
         return 1

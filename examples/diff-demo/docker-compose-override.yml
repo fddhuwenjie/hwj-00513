@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  web:
+    environment:
+      APP_DEBUG: "true"
+      EXTRA_FLAG: enabled
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./local-scripts:/scripts
