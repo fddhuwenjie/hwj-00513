@@ -1,0 +1,144 @@
+version: '3.8'
+
+services:
+  web-app:
+    image: nginx
+    container_name: risky_nginx
+    ports:
+      - "80:80"
+      - "8080:80"
+      - "3306:3306"
+      - "9000-9010:9000-9010"
+      - "9005:9005"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./html:/usr/share/nginx/html
+    environment:
+      DB_PASSWORD: SuperSecret123!
+      ADMIN_API_KEY: sk-live-abcdefghijklmnop
+      REDIS_PASSWORD: admin123
+    privileged: true
+    cap_add:
+      - ALL
+      - SYS_ADMIN
+    depends_on:
+      - database
+      - cache
+      - admin-panel
+    networks:
+      - net1
+    restart: "no"
+
+  admin-panel:
+    image: phpmyadmin:latest
+    container_name: risky_phpmyadmin
+    ports:
+      - "8080:80"
+      - "80:8080"
+    environment:
+      PMA_HOST: database
+      PMA_USER: root
+      PMA_PASSWORD: password123
+      MYSQL_ROOT_PASSWORD: password123
+    depends_on:
+      - database
+      - web-app
+    networks:
+      - net1
+      - net2
+
+  database:
+    image: mysql
+    container_name: risky_mysql
+    ports:
+      - "3306:3306"
+      - "33060:33060"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: app_db
+      MYSQL_USER: app_user
+      MYSQL_PASSWORD: plaintext_password
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - net1
+      - net2
+    depends_on:
+      - admin-panel
+
+  cache:
+    image: redis:latest
+    container_name: risky_redis
+    ports:
+      - "6379:6379"
+      - "6379:6380"
+    command: redis-server --requirepass mypassword
+    environment:
+      REDIS_PASSWORD: mypassword
+    networks:
+      - net1
+      - net2
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_PTRACE
+    depends_on:
+      - message-queue
+
+  worker:
+    image: python:3.11
+    container_name: risky_worker
+    user: root
+    volumes:
+      - ./worker:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      DATABASE_URL: mysql://app_user:plaintext_password@database:3306/app_db
+      REDIS_URL: redis://:mypassword@cache:6379/0
+      QUEUE_HOST: message-queue
+      QUEUE_PORT: 5672
+      QUEUE_USER: admin
+      QUEUE_PASSWORD: guest
+    working_dir: /app
+    command: python worker.py
+    depends_on:
+      - database
+      - cache
+      - message-queue
+    networks:
+      - net2
+    deploy:
+      resources:
+        limits:
+          cpus: '8.0'
+          memory: 16G
+        reservations:
+          cpus: '4.0'
+          memory: 8G
+    labels:
+      com.example.resource-estimate-cpu: "6000m"
+      com.example.resource-estimate-mem: "12g"
+
+  message-queue:
+    image: rabbitmq:3-management
+    container_name: risky_rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+      - "5672:5673"
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: guest
+    networks:
+      - net2
+    depends_on:
+      - web-app
+
+networks:
+  net1:
+    driver: bridge
+  net2:
+    driver: bridge
+
+volumes:
+  mysql_data:
